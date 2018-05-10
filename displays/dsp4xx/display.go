@@ -1,29 +1,16 @@
-package displays
+package dsp4xx
 
 import (
-	"github.com/tarm/goserial"
+	goserial "github.com/tarm/goserial"
 	"io"
 	"runtime"
 	"sync"
 	"time"
+	"github.com/reimashi/godevices/displays"
+	"github.com/reimashi/godevices/interfaces"
+	"github.com/reimashi/godevices/interfaces/serial"
+	"errors"
 )
-
-type IDisplay interface {
-	Clear()
-	ClearLine(line int)
-	GetLineLength(line int) int
-	GetName() string
-	GetNumLines() int
-	Init() error
-	Write(str string, line int, offset int, clear bool)
-}
-
-type DisplayInfo struct {
-	Name        string
-	Lines       int
-	LineLength  []int
-	RefreshTime int
-}
 
 type displayCommand byte
 
@@ -50,23 +37,34 @@ const (
 	MODE_DSP_800       displayMode = 0x07
 )
 
-type DisplayDsp4xx struct {
-	Port       string
-	Baud       int
+const (
+	model = "DSP-4xx"
+	vendor = "unknown"
+	lines = 2
+	refresh = 80
+)
+
+var (
+	lineLength = []int{20, 20}
+)
+
+type Dsp4xx struct {
+	serial.Device
+	displays.TextDisplay
+
+	config *serial.Config
 	serialPort io.ReadWriteCloser
-	mutexWr    *sync.Mutex
-	info       DisplayInfo
+	mutexWr *sync.Mutex
+
+	RefreshTime int
 }
 
-func Open(port string, baud int) (*DisplayDsp4xx, error) {
-	this := &DisplayDsp4xx{
-		Port: port,
-		Baud: baud,
-	}
+func Open(config *serial.Config) (*Dsp4xx, error) {
+	this := &Dsp4xx{ config: config }
 
-	c := &serial.Config{Name: this.Port, Baud: this.Baud}
+	c := &goserial.Config{Name: this.config.GetPortAddress(), Baud: this.config.GetBaud()}
 
-	s, err := serial.OpenPort(c)
+	s, err := goserial.OpenPort(c)
 
 	if err != nil {
 		return nil, err
@@ -74,56 +72,51 @@ func Open(port string, baud int) (*DisplayDsp4xx, error) {
 
 	this.serialPort = s
 	this.mutexWr = &sync.Mutex{}
-	this.info = DisplayInfo{
-		Name:        "DSP-4XX",
-		Lines:       2,
-		LineLength:  []int{20, 20},
-		RefreshTime: 80}
-
 	this.deviceMode(MODE_DSP_T)
 
 	return this, nil
 }
 
-func (t DisplayDsp4xx) Clear() {
-	t.deviceClear(1, 40)
+// TextDisplay interface
+
+func (t *Dsp4xx) Clear() error {
+	return t.deviceClear(1, 40)
 }
 
-func (t DisplayDsp4xx) ClearLine(line int) {
-	if line >= 0 && line < t.info.Lines {
-		startpos := (line * t.info.LineLength[line]) + 1
-		t.deviceClear(startpos, startpos+t.info.LineLength[line]-1)
+func (t *Dsp4xx) ClearLine(line int) error {
+	if line >= 0 && line < lines {
+		startpos := (line * lineLength[line]) + 1
+		return t.deviceClear(startpos, startpos + lineLength[line]-1)
 	}
+
+	return errors.New("invalid line")
 }
 
-func (t DisplayDsp4xx) GetLineLength(line int) int {
-	if line >= 0 && line < t.info.Lines {
-		return t.info.LineLength[line]
+func (t *Dsp4xx) GetLineCount() int {
+	return lines
+}
+
+func (t *Dsp4xx) GetLineSize(line int) int {
+	if line >= 0 && line < lines {
+		return lineLength[line]
 	}
 
 	return 0
 }
 
-func (t DisplayDsp4xx) GetName() string {
-	return t.info.Name
-}
-
-func (t DisplayDsp4xx) GetNumLines() int {
-	return t.info.Lines
-}
-
-func (t DisplayDsp4xx) Write(str string, line int, offset int, clear bool) {
-	if line >= 0 && line < t.info.Lines {
-		if clear {
-			t.ClearLine(line)
+func (t *Dsp4xx) Write(str string, line int, offset int, clearLine bool) error {
+	if line >= 0 && line < lines {
+		if clearLine {
+			err := t.ClearLine(line)
+			if err != nil { return err }
 		}
 
-		if offset >= 0 && offset < t.info.LineLength[line] {
+		if offset >= 0 && offset < lineLength[line] {
 			t.deviceSetCursor(line, offset)
 
 			countw := len(str)
-			if offset+countw > t.info.LineLength[line] {
-				countw = t.info.LineLength[line] - offset
+			if offset+countw > lineLength[line] {
+				countw = lineLength[line] - offset
 			}
 
 			towrite := str
@@ -131,38 +124,42 @@ func (t DisplayDsp4xx) Write(str string, line int, offset int, clear bool) {
 				towrite = str[:countw]
 			}
 
-			t.deviceWrite([]byte(towrite), t.info.RefreshTime)
+			return t.deviceWrite([]byte(towrite), refresh)
+		} else {
+			return errors.New("invalid offset")
 		}
+	} else {
+		return errors.New("invalid line")
 	}
 }
 
-func (t DisplayDsp4xx) dspCodificationNumber(i int) byte {
-	if i >= 0 || i <= t.info.LineLength[1]*t.info.Lines {
+func (t *Dsp4xx) dspCodificationNumber(i int) byte {
+	if i >= 0 || i <= lineLength[1] * lines {
 		return byte(i + 48)
 	} else {
 		return 0
 	}
 }
 
-func (t DisplayDsp4xx) deviceMode(mode displayMode) {
+func (t *Dsp4xx) deviceMode(mode displayMode) {
 	code := []byte{byte(COM_SET_MODE), byte(mode), byte(COM_SET_MODE)}
 	t.deviceWrite(code, 1200)
 }
 
-func (t DisplayDsp4xx) deviceClear(start int, end int) {
+func (t *Dsp4xx) deviceClear(start int, end int) error {
 	startb := t.dspCodificationNumber(start)
 	endb := t.dspCodificationNumber(end)
 	code := []byte{0x04, 0x01, byte(COM_CLEAR), startb, endb, 0x17}
-	t.deviceWrite(code, t.info.RefreshTime)
+	return t.deviceWrite(code, refresh)
 }
 
-func (t DisplayDsp4xx) deviceSetCursor(line int, offset int) {
-	cpos := t.dspCodificationNumber((line * t.info.LineLength[line]) + offset + 1)
+func (t *Dsp4xx) deviceSetCursor(line int, offset int) {
+	cpos := t.dspCodificationNumber((line * lineLength[line]) + offset + 1)
 	code := []byte{0x04, 0x01, byte(COM_SET_CURSOR), cpos, 0x17}
-	t.deviceWrite(code, t.info.RefreshTime)
+	t.deviceWrite(code, refresh)
 }
 
-func (t DisplayDsp4xx) deviceWrite(data []byte, refresh int) error {
+func (t *Dsp4xx) deviceWrite(data []byte, refresh int) error {
 	t.mutexWr.Lock()
 
 	_, err := t.serialPort.Write(data)
@@ -175,4 +172,18 @@ func (t DisplayDsp4xx) deviceWrite(data []byte, refresh int) error {
 	runtime.Gosched()
 
 	return err
+}
+
+// Device interface
+
+func (t *Dsp4xx) GetModel() string {
+	return model
+}
+
+func (t *Dsp4xx) GetVendor() string {
+	return vendor
+}
+
+func (t *Dsp4xx) GetInterfaceType() interfaces.Type {
+	return interfaces.Serial
 }
